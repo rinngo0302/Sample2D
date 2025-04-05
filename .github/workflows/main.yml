@@ -1,0 +1,145 @@
+name: ChatGPT Review and Comment
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review_and_comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout Repository with Full History
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Find Branch Point Commit
+      id: find-base
+      run: |
+        BASE_COMMIT=$(git merge-base HEAD origin/${{ github.base_ref }})
+        echo "BASE_COMMIT=$BASE_COMMIT" >> $GITHUB_ENV
+
+    - name: Checkout Base Branch at Branch Point
+      run: |
+        mkdir base
+        git --work-tree=base checkout $BASE_COMMIT -- .
+
+    - name: Checkout Head Branch (After Changes)
+      run: |
+        mkdir head
+        git --work-tree=head checkout HEAD -- .
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl jq diffutils moreutils
+
+    - name: Generate Diffs for Each Swift File
+      run: |
+        mkdir -p diffs
+        find head/ -type f -name "*.cs" -print0 | while IFS= read -r -d '' file; do
+          base_file="base/${file#head/}"
+          head_file="$file"
+          diff_path="diffs/$(echo "$file" | sed 's|/|_|g').diff"
+
+          if [ -f "$base_file" ]; then
+            diff -u "$base_file" "$head_file" > "$diff_path" || true
+          else
+            diff -u /dev/null "$head_file" > "$diff_path" || true
+          fi
+
+          if [ ! -s "$diff_path" ]; then
+            rm "$diff_path"
+          fi
+        done
+
+    - name: Review Each Diff in Parallel
+      env:
+        GITHUB_PAT: ${{ secrets.PERSONAL_ACCESSTOKEN }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        OPENAI_ENDPOINT_URL: ${{ secrets.OPENAI_ENDPOINT_URL }}
+      run: |
+        PR_NUMBER=$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")
+        PR_TITLE=$(jq -r .pull_request.title "$GITHUB_EVENT_PATH")
+
+        mkdir -p reviews
+
+        process_diff() {
+          local PART="$1"
+          local FILE_NAME=$(basename "$PART" .diff)
+
+          PR_BODY=$(cat "$PART" | sed 's/"/\\"/g' | jq -Rs .)
+
+          JSON_STRING=$(jq -n \
+            --arg title "$PR_TITLE" \
+            --arg body "$PR_BODY" \
+            '{
+              messages: [
+                {
+                  role: "system",
+                  content: "あなたは優秀なテックリードです。最新のC#,Unityの基本的なコードの書き方は熟知しており、それらのコンポーネントやUnityのゲームのアンチパターンなどに関しても世界でも有数の知見を持っています。\n
+以下のルールに従ってコードレビューを行ってください。\n
+レビューはプルリクエストが反映されたコードに対して行います。プルリクエストが反映される前のコードを見ることは一切禁じます。\n
+以下で記載する修正前はプルリクエストが反映されたコードを指し、修正後はあなたがレビューを行い修正を反映したものです。\n
+レビューの結果問題がなければそのファイルについては一切の記載を禁じます。\n
+レビューは問題点に対してのみ行い、問題点のないファイルについては記載しないでください。\n
+問題点がある場合には修正前と修正後のコードを提示し、どういった観点から修正すべきかを指摘しているかも含めて提示してください。\n
+問題文の指摘がある場合、Markdown形式で折り畳みが行えるように指摘全体を<details></details>タグで囲み、<summary></summary>タグで指摘を行うファイル名を囲むようにしてください。"
+                },
+                {
+                  role: "user",
+                  content: ($title + "\n\n" + $body)
+                }
+              ],
+              max_tokens: 1500
+            }'
+          )
+
+          echo "$JSON_STRING" > request.json
+
+          RESPONSE=$(curl -s -X POST "$OPENAI_ENDPOINT_URL" \
+            -H "Content-Type: application/json" \
+            -H "api-key: $OPENAI_API_KEY" \
+            --data @request.json)
+
+          if echo "$RESPONSE" | jq -e .choices[0].message.content > /dev/null; then
+            REVIEW=$(echo "$RESPONSE" | jq -r .choices[0].message.content | sed 's/$/<br>/' )
+            if [ -n "$REVIEW" ]; then
+              echo "Review for $FILE_NAME<br>" > "reviews/review_$(basename "$PART")"
+              echo "$REVIEW" >> "reviews/review_$(basename "$PART")"
+            fi
+          else
+            echo "OpenAI API エラー: $RESPONSE" >&2
+          fi
+        }
+
+        export -f process_diff
+        find diffs -type f -name "*.diff" -print0 | xargs -0 -n 1 -P 4 -I{} bash -c 'process_diff "$@"' _ {}
+
+    - name: Combine Reviews
+      run: |
+        echo "### Combined Review Comments<br>" > combined_reviews.md
+        if [ -z "$(ls -A reviews)" ]; then
+          echo "No reviews to combine<br>" >> combined_reviews.md
+        else
+          for review in reviews/*; do
+            cat "$review" >> combined_reviews.md
+            echo "<br>---<br>" >> combined_reviews.md
+          done
+        fi
+
+    - name: Post Combined Review Comment
+      env:
+        GITHUB_PAT: ${{ secrets.PERSONAL_ACCESSTOKEN }}
+      run: |
+        PR_NUMBER=$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")
+        COMBINED_REVIEW=$(cat combined_reviews.md)
+
+        POST_DATA=$(jq -n --arg body "$COMBINED_REVIEW" '{"body": $body}')
+
+        curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          -H "Authorization: Bearer $GITHUB_PAT" \
+          -H "Content-Type: application/json" \
+          --data "$POST_DATA"
