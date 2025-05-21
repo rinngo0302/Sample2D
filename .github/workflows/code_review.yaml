@@ -18,25 +18,21 @@ jobs:
           fetch-depth: 0 # 差分を取得するために全履歴を取得
 
       - name: Get changed files and set environment variables
-        id: set_vars # ステップIDは必須ではないが、可読性のために残しても良い
+        id: set_vars
         run: |
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          echo "BASE_SHA_ENV=${BASE_SHA}" >> $GITHUB_ENV
-          echo "HEAD_SHA_ENV=${HEAD_SHA}" >> $GITHUB_ENV
-
-          # 変更された対象ファイル（拡張子でフィルタリング）のリストをスペース区切りで取得
-          # xargs はファイル名にスペースが含まれると問題を起こす可能性があるため、より安全な方法を検討するか、
-          # ファイル名にスペースがない前提であればこのままでも可。
-          # より堅牢にするなら、Pythonスクリプト側でgit diffの結果を直接処理する方が良い場合もある。
-          CHANGED_FILES_LIST=$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | grep -E '\.(js|py|java|ts|go|rb|php|cs|cpp|c|swift|kt|m|html|css|scss)$' | tr '\n' ' ' | sed 's/ $//')
+          CHANGED_FILES_LIST=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+            | grep -E '\.(js|py|java|ts|go|rb|php|cs|cpp|c|swift|kt|m|html|css|scss)$' \
+            | tr '\n' ' ' | sed 's/ $//')
 
           if [ -n "$CHANGED_FILES_LIST" ]; then
-            echo "CHANGED_FILES_TO_REVIEW=${CHANGED_FILES_LIST}" >> $GITHUB_ENV
-            echo "HAS_CHANGED_FILES=true" >> $GITHUB_ENV
-            echo "Changed files to review: $CHANGED_FILES_TO_REVIEW"
+            echo "CHANGED_FILES_TO_REVIEW=$CHANGED_FILES_LIST" >> $GITHUB_ENV
+            echo "HAS_CHANGED_FILES=true"             >> $GITHUB_ENV
+            # デバッグ表示するならこちらを使う
+            echo "Changed files to review: $CHANGED_FILES_LIST"
           else
-            echo "HAS_CHANGED_FILES=false" >> $GITHUB_ENV
+            echo "HAS_CHANGED_FILES=false"            >> $GITHUB_ENV
             echo "No relevant files changed for review."
           fi
 
@@ -52,40 +48,24 @@ jobs:
 
       - name: Run Gemini Code Review
         if: env.HAS_CHANGED_FILES == 'true'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # CHANGED_FILES_TO_REVIEW は上のステップで $GITHUB_ENV に設定されるため、ここで明示的に env マップに入れる必要はない。
-          # Python スクリプト内で os.environ.get("CHANGED_FILES_TO_REVIEW") で取得できる。
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          # Pythonスクリプトの呼び出し (内容は変更なし、ただし環境変数 CHANGED_FILES の取得方法を修正)
-          # (例: python .github/scripts/review_code.py)
-          # Pythonスクリプトの修正箇所は後述
+          # スクリプト配置先ディレクトリを作成
+          mkdir -p .github/scripts
+
+          # Python スクリプトを出力（インデントは行頭揃え）
           cat << 'EOF' > .github/scripts/review_code.py
-          import os
-          import requests
-          import json
+import os
+import requests
+import json
 
-          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-          # CHANGED_FILES_TO_REVIEW 環境変数からファイルリストを取得
-          CHANGED_FILES = os.environ.get("CHANGED_FILES_TO_REVIEW", "").split()
-          GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-          PR_NUMBER = os.environ.get("PR_NUMBER")
-          REPO_OWNER = os.environ.get("REPO_OWNER")
-          REPO_NAME = os.environ.get("REPO_NAME")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+CHANGED_FILES   = os.environ.get("CHANGED_FILES_TO_REVIEW", "").split()
+GITHUB_TOKEN    = os.environ["GITHUB_TOKEN"]
+PR_NUMBER       = os.environ["PR_NUMBER"]
+REPO_OWNER      = os.environ["REPO_OWNER"]
+REPO_NAME       = os.environ["REPO_NAME"]
 
-          # (以降のPythonスクリプトは前回提示したものと同様だが、CHANGED_FILES の取得方法が上記のように変更される)
-          # ... (API_URL, headers, github_comments_url, github_headers の設定) ...
-          # ... (all_reviews の初期化) ...
+# …以下省略…
+EOF
 
-          if not CHANGED_FILES or not CHANGED_FILES[0]: # split() は空文字列に対して [''] を返すことがあるためチェック
-              print("No relevant files changed for review (checked in Python script).")
-              exit()
-
-          # ... (for file_path in CHANGED_FILES: ループと API 呼び出し) ...
-          # ... (コメント投稿処理) ...
-          EOF
           python .github/scripts/review_code.py
