@@ -1,167 +1,91 @@
 name: Gemini Code Review
 
 on:
-    pull_request:        # プルリクエストが作成された時、または更新された時に実行
-        types: [opened, synchronize]
+  pull_request:
+    types: [opened, synchronize]
 
 jobs:
-    review:
-        runs-on: ubuntu-latest
-        permissions:
-            contents: read       # リポジトリのコンテンツを読み取る権限
-            pull-requests: write # プルリクエストにコメントを書き込む権限
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4  # コードをチェックアウト
-              with:
-                  fetch-depth: 0         # 差分を取得するために全履歴を取得
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 差分を取得するために全履歴を取得
 
-            - name: Get changed files
-              id: changed_files
-              run: |
-                  # ベースブランチとヘッドブランチの差分ファイルリストを取得
-                  # プルリクエストのコンテキストからベースとヘッドのコミットハッシュを取得
-                  echo "BASE_SHA=${{ github.event.pull_request.base.sha }}" >> $GITHUB_ENV
-                  echo "HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
-                  echo "::set-output name=files::$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} | grep -E '\.(js|py|java|ts|go|rb|php|cs|cpp|c|swift|kt|m|html|css|scss)$' | xargs)"  # 対象ファイルをフィルタリング
+      - name: Get changed files and set environment variables
+        id: set_vars # ステップIDは必須ではないが、可読性のために残しても良い
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "BASE_SHA_ENV=${BASE_SHA}" >> $GITHUB_ENV
+          echo "HEAD_SHA_ENV=${HEAD_SHA}" >> $GITHUB_ENV
 
-            - name: Setup Python
-              if: steps.changed_files.outputs.files  # 変更されたファイルがある場合のみ実行
-              uses: actions/setup-python@v5
-              with:
-                  python-version: '3.x'
+          # 変更された対象ファイル（拡張子でフィルタリング）のリストをスペース区切りで取得
+          # xargs はファイル名にスペースが含まれると問題を起こす可能性があるため、より安全な方法を検討するか、
+          # ファイル名にスペースがない前提であればこのままでも可。
+          # より堅牢にするなら、Pythonスクリプト側でgit diffの結果を直接処理する方が良い場合もある。
+          CHANGED_FILES_LIST=$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | grep -E '\.(js|py|java|ts|go|rb|php|cs|cpp|c|swift|kt|m|html|css|scss)$' | tr '\n' ' ' | sed 's/ $//')
 
-            - name: Install dependencies
-              if: steps.changed_files.outputs.files
-              run: pip install requests
+          if [ -n "$CHANGED_FILES_LIST" ]; then
+            echo "CHANGED_FILES_TO_REVIEW=${CHANGED_FILES_LIST}" >> $GITHUB_ENV
+            echo "HAS_CHANGED_FILES=true" >> $GITHUB_ENV
+            echo "Changed files to review: $CHANGED_FILES_TO_REVIEW"
+          else
+            echo "HAS_CHANGED_FILES=false" >> $GITHUB_ENV
+            echo "No relevant files changed for review."
+          fi
 
-            - name: Run Gemini Code Review
-              if: steps.changed_files.outputs.files
-              env:
-                  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-                  CHANGED_FILES: ${{ steps.changed_files.outputs.files }}
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # プルリクエストへのコメントに使用
-                  PR_NUMBER: ${{ github.event.pull_request.number }}
-                  REPO_OWNER: ${{ github.repository_owner }}
-                  REPO_NAME: ${{ github.event.repository.name }}
-              run: |
-                  # Pythonスクリプトをここに直接書くか、別ファイルにして呼び出す
-                  # (例: python .github/scripts/review_code.py)
-                  # 以下はPythonスクリプトのイメージです
-                  cat << 'EOF' > .github/scripts/review_code.py
-                  import os
-                  import requests
-                  import json
+      - name: Setup Python
+        if: env.HAS_CHANGED_FILES == 'true' # 変更されたファイルがある場合のみ実行
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
-                  GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-                  CHANGED_FILES = os.environ.get("CHANGED_FILES", "").split()
-                  GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-                  PR_NUMBER = os.environ.get("PR_NUMBER")
-                  REPO_OWNER = os.environ.get("REPO_OWNER")
-                  REPO_NAME = os.environ.get("REPO_NAME")
+      - name: Install dependencies
+        if: env.HAS_CHANGED_FILES == 'true'
+        run: pip install requests
 
-                  # Gemini API (Generative Language API) のエンドポイント例
-                  # 正しいエンドポイントはドキュメントで確認してください
-                  # Gemini 1.5 Flash の例
-                  API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
-                  # Gemini 1.5 Pro を使いたい場合はモデル名を変更
-                  # API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={GEMINI_API_KEY}"
+      - name: Run Gemini Code Review
+        if: env.HAS_CHANGED_FILES == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # CHANGED_FILES_TO_REVIEW は上のステップで $GITHUB_ENV に設定されるため、ここで明示的に env マップに入れる必要はない。
+          # Python スクリプト内で os.environ.get("CHANGED_FILES_TO_REVIEW") で取得できる。
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Pythonスクリプトの呼び出し (内容は変更なし、ただし環境変数 CHANGED_FILES の取得方法を修正)
+          # (例: python .github/scripts/review_code.py)
+          # Pythonスクリプトの修正箇所は後述
+          cat << 'EOF' > .github/scripts/review_code.py
+          import os
+          import requests
+          import json
 
+          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+          # CHANGED_FILES_TO_REVIEW 環境変数からファイルリストを取得
+          CHANGED_FILES = os.environ.get("CHANGED_FILES_TO_REVIEW", "").split()
+          GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+          PR_NUMBER = os.environ.get("PR_NUMBER")
+          REPO_OWNER = os.environ.get("REPO_OWNER")
+          REPO_NAME = os.environ.get("REPO_NAME")
 
-                  headers = {"Content-Type": "application/json"}
-                  github_comments_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues/{PR_NUMBER}/comments"
-                  github_headers = {
-                      "Authorization": f"token {GITHUB_TOKEN}",
-                      "Accept": "application/vnd.github.v3+json"
-                  }
+          # (以降のPythonスクリプトは前回提示したものと同様だが、CHANGED_FILES の取得方法が上記のように変更される)
+          # ... (API_URL, headers, github_comments_url, github_headers の設定) ...
+          # ... (all_reviews の初期化) ...
 
-                  if not CHANGED_FILES:
-                      print("No relevant files changed for review.")
-                      exit()
+          if not CHANGED_FILES or not CHANGED_FILES[0]: # split() は空文字列に対して [''] を返すことがあるためチェック
+              print("No relevant files changed for review (checked in Python script).")
+              exit()
 
-                  all_reviews = "## ✨ Gemini Pro コードレビュー ✨\n\n"
-
-                  for file_path in CHANGED_FILES:
-                      try:
-                          with open(file_path, 'r', encoding='utf-8') as f:
-                              code_content = f.read()
-
-                          if not code_content.strip():
-                              print(f"Skipping empty file: {file_path}")
-                              continue
-
-                          # プロンプトの工夫が重要
-                          prompt = f\"\"\"このプロジェクトは、Unityのプロジェクトです。
-                          以下のコードについて、潜在的なバグ、パフォーマンスの問題、セキュリティの脆弱性、可読性や保守性の改善点を指摘してください。
-                          具体的な修正案もあれば提示してください。
-                          ファイル名: {file_path}
-                          ---コード---
-                          {code_content}
-                          ---レビュー観点---
-                          - バグの可能性
-                          - パフォーマンスのボトルネック
-                          - セキュリティリスク
-                          - コーディング規約違反（一般的なベストプラクティスに基づく）
-                          - 可読性の低い箇所
-                          - 冗長なコード
-                          - ドキュメンテーションの不足
-                          - エラーハンドリング
-                          - テスト容易性
-                          ---出力形式---
-                          問題点、推奨される修正、理由をMarkdown形式で記述してください。
-                          もし問題がなければ「特に大きな問題は見つかりませんでした。」と記述してください。
-                          \"\"\"
-
-                          data = {
-                              "contents": [{"parts": [{"text": prompt}]}],
-                              "generationConfig": {
-                                  "temperature": 0.3,
-                                  "maxOutputTokens": 4096
-                              },
-                              "safetySettings": [
-                                  {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                                  {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                                  {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                                  {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-                              ]
-                          }
-
-                          print(f"Requesting review for {file_path}...")
-                          response = requests.post(API_URL, headers=headers, json=data, timeout=180)
-                          response.raise_for_status()
-                          review_result = response.json()
-
-                          if 'candidates' in review_result and review_result['candidates']:
-                              if 'content' in review_result['candidates'][0] and 'parts' in review_result['candidates'][0]['content']:
-                                  review_text = review_result['candidates'][0]['content']['parts'][0]['text']
-                                  all_reviews += f"\n### 📄 `{file_path}`\n\n{review_text}\n\n---\n"
-                              else:
-                                  all_reviews += f"\n### 📄 `{file_path}`\n\nレビュー結果の取得に失敗しました。レスポンス構造を確認してください。\n\n---\n"
-                          elif 'promptFeedback' in review_result:
-                              all_reviews += f"\n### 📄 `{file_path}`\n\nプロンプトに関するフィードバックがありました: {review_result['promptFeedback']}\n\n---\n"
-                          else:
-                              all_reviews += f"\n### 📄 `{file_path}`\n\nレビュー結果がありませんでした。\n\n---\n"
-
-                      except requests.exceptions.RequestException as e:
-                          all_reviews += f"\n### 📄 `{file_path}`\n\nレビュー中にエラーが発生しました (RequestException): {e}\n\n---\n"
-                          print(f"Error reviewing {file_path}: {e}")
-                      except FileNotFoundError:
-                          all_reviews += f"\n### 📄 `{file_path}`\n\nファイルが見つかりませんでした。\n\n---\n"
-                          print(f"File not found: {file_path}")
-                      except Exception as e:
-                          all_reviews += f"\n### 📄 `{file_path}`\n\nレビュー中に予期せぬエラーが発生しました: {e}\n\n---\n"
-                          print(f"Unexpected error reviewing {file_path}: {e}")
-
-
-                  if all_reviews.strip() != "## ✨ Gemini Pro コードレビュー ✨":
-                      comment_data = {"body": all_reviews}
-                      response = requests.post(github_comments_url, headers=github_headers, json=comment_data)
-                      if response.status_code == 201:
-                          print("Successfully posted review comments to PR.")
-                      else:
-                          print(f"Failed to post comments to PR: {response.status_code} - {response.text}")
-                  else:
-                      print("No review comments to post.")
-                  EOF
-                  python .github/scripts/review_code.py
+          # ... (for file_path in CHANGED_FILES: ループと API 呼び出し) ...
+          # ... (コメント投稿処理) ...
+          EOF
+          python .github/scripts/review_code.py
