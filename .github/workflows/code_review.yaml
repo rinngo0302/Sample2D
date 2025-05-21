@@ -1,0 +1,71 @@
+name: Gemini Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 差分を取得するために全履歴を取得
+
+      - name: Get changed files and set environment variables
+        id: set_vars
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED_FILES_LIST=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+            | grep -E '\.(js|py|java|ts|go|rb|php|cs|cpp|c|swift|kt|m|html|css|scss)$' \
+            | tr '\n' ' ' | sed 's/ $//')
+
+          if [ -n "$CHANGED_FILES_LIST" ]; then
+            echo "CHANGED_FILES_TO_REVIEW=$CHANGED_FILES_LIST" >> $GITHUB_ENV
+            echo "HAS_CHANGED_FILES=true"             >> $GITHUB_ENV
+            # デバッグ表示するならこちらを使う
+            echo "Changed files to review: $CHANGED_FILES_LIST"
+          else
+            echo "HAS_CHANGED_FILES=false"            >> $GITHUB_ENV
+            echo "No relevant files changed for review."
+          fi
+
+      - name: Setup Python
+        if: env.HAS_CHANGED_FILES == 'true' # 変更されたファイルがある場合のみ実行
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        if: env.HAS_CHANGED_FILES == 'true'
+        run: pip install requests
+
+      - name: Run Gemini Code Review
+        if: env.HAS_CHANGED_FILES == 'true'
+        run: |
+          # スクリプト配置先ディレクトリを作成
+          mkdir -p .github/scripts
+
+          # Python スクリプトを出力（インデントは行頭揃え）
+          cat << 'EOF' > .github/scripts/review_code.py
+import os
+import requests
+import json
+
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+CHANGED_FILES   = os.environ.get("CHANGED_FILES_TO_REVIEW", "").split()
+GITHUB_TOKEN    = os.environ["GITHUB_TOKEN"]
+PR_NUMBER       = os.environ["PR_NUMBER"]
+REPO_OWNER      = os.environ["REPO_OWNER"]
+REPO_NAME       = os.environ["REPO_NAME"]
+
+# …以下省略…
+EOF
+
+          python .github/scripts/review_code.py
